@@ -3,7 +3,6 @@ package io.walakka.postgres.replication
 import io.walakka.postgres.replication.logicaldecoding.{PgLogicalDecodingLexer, PgLogicalDecodingParser}
 import org.antlr.v4.runtime.tree.ParseTreeWalker
 import org.antlr.v4.runtime.{CharStreams, CommonTokenStream}
-import org.json4s.JValue
 
 trait TestDecodingUtil {
 

@@ -7,9 +7,9 @@ The Postgres write-ahead-log (WAL) may be accessed through the logical replicati
 walakka aims to solve this by creating additional replication slots when a fall behind scenario is detected. The high-level flow can be explained as follows:
 1. Create a replication slot with a corresponding replication actor
 2. While the replication actor processes the WAL, continually monitor how far behind the WAL consumer is from the tip of the WAL. This can be measured in disk space via the following query:
-  ```
-  select pg_xlog_location_diff(pg_current_xlog_insert_location(), restart_lsn) from pg_replication_slots where slot_name = $slotName
-  ```
+      ```
+      select pg_xlog_location_diff(pg_current_xlog_insert_location(), restart_lsn) from pg_replication_slots where slot_name = $slotName
+      ```
 3. When the difference between the tip of the WAL and the restart_lsn exceeds a given threshold, **create a new replication slot and corresponding replication actor and update the previous replication actor with the LSN of the newly created slot (ie the tip of WAL)**.
     * When the first replication actor reaches the LSN of the newly created slot; terminate the actor and remove the replication slot. This indicates the first replication process has 'caught up'.
 4. Continuously monitor and apply step 3 to newly created replication slots.
@@ -23,3 +23,4 @@ walakka aims to solve this by creating additional replication slots when a fall 
 2. `docker run -d -t -p 5432:5432 --name postgres postgres`
 3. `sbt flywayMigrate`
 4. `sbt "runMain io.walakka.WalAkka"`
+
