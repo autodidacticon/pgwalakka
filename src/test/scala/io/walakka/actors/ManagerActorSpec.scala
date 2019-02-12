@@ -3,6 +3,7 @@ package io.walakka.actors
 import akka.actor.{ActorRef, ActorSystem, PoisonPill, Props}
 import akka.testkit.{TestKit, TestProbe}
 import io.walakka.postgres.replication.ActiveSlot
+import org.postgresql.PGConnection
 import org.postgresql.replication.PGReplicationStream
 import org.scalatest._
 import org.scalatest.concurrent.Futures
@@ -39,7 +40,7 @@ class ManagerActorSpec(_system: ActorSystem)
     extends ManagerActor(replicationOptions, refOpt) {
     override def createReplicationStream(slotName: String,
                                          slotOptions: Map[String, String],
-                                         statusInterval: Int): PGReplicationStream = mock[PGReplicationStream]
+                                         statusInterval: Int)(cnxn: PGConnection): PGReplicationStream = mock[PGReplicationStream]
   }
 
   def getTestMgr(name: String = testMgrName, testProbeRef: Option[ActorRef] = None) =

@@ -2,70 +2,89 @@ package io.walakka.actors
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.sql.Connection
 
-import akka.actor.{Actor, ActorRef, PoisonPill, Props, Terminated}
-import akka.pattern.ask
+import akka.actor.{Actor, ActorRef, Props, Terminated}
+import akka.stream.scaladsl.{Sink, Source}
+import akka.stream.{ActorMaterializer, KillSwitches}
 import akka.util.Timeout
 import com.typesafe.scalalogging.LazyLogging
-import io.walakka.postgres.replication.{ActiveSlot, ReplicationManager, SlotStatus, TestDecodingUtil}
+import io.walakka.actors.ReplicationActor.{StopProcessing, StreamStatus}
+import io.walakka.postgres.replication._
+import org.postgresql.PGConnection
 import org.postgresql.replication.{LogSequenceNumber, PGReplicationStream}
 
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
 
-class ReplicationActor(val slotName: String, val stream: PGReplicationStream)
+class ReplicationActor(val slotName: String, val cnxn: PGConnection, val streamFun: PGConnection => PGReplicationStream)
                       (implicit val ec: ExecutionContext = ExecutionContext.global)
-    extends Actor
+  extends Actor
     with TestDecodingUtil
     with LazyLogging {
-
-
-  private var processing: Boolean = false
 
   def decodeBytes(byteBuffer: ByteBuffer) =
     StandardCharsets.UTF_8.decode(byteBuffer).toString
 
-  def msgSource: Stream[String] =
-    Stream.continually(stream.read).map(decodeBytes)
-
-  def processWal: Unit = {
-    msgSource
-      .map(parseMsg)
+  lazy val processWal = {
+    source
       //filter out DDL stmts which do not produce DbMsg
-      .flatMap(p => p)
-      .foreach(db => {
-        logger.debug(db.toString)
-        stream.setFlushedLSN(stream.getLastReceiveLSN)
-        Thread.sleep(1000)
-      })
+      .via(killSwitch.flow)
+      .map { case (bytes, lsn) => decodeBytes(bytes) -> lsn }
+      .map { case (dbMsg, lsn) => parseMsg(dbMsg) -> lsn }
+      .runFoldAsync(()) {
+        case (_, (dbMsgOpt, lsn)) => Future {
+          logger.debug(dbMsgOpt.toString)
+          stream.setFlushedLSN(lsn)
+          stream.setAppliedLSN(lsn)
+        }
+      }(ActorMaterializer())
+  }
+
+  val killSwitch = KillSwitches.shared(slotName)
+
+  lazy val stream = streamFun(cnxn)
+
+  lazy val source = Source.unfoldAsync(None)(_ => Future(Some(None, stream.read() -> stream.getLastReceiveLSN)))
+
+  lazy val sink = Sink.foreach[(Option[DbMsg], LogSequenceNumber)] { case (dbMsgOpt, lsn) => {
+    logger.debug(dbMsgOpt.toString)
+    stream.setFlushedLSN(lsn)
+    stream.setAppliedLSN(lsn)
+  }
   }
 
   override def receive: Receive = {
-    case ReplicationActor.StartProcessing =>
-      processing match {
-        case true => sender() ! ReplicationActor.Processing
-        case false => {
-          Future {
-            processing = true
-            processWal
-          }
-          sender() ! ReplicationActor.Processing
-        }
-      }
+    case ReplicationActor.StartProcessing => processWal
+    case ReplicationActor.StopProcessing => {
+      stream.close()
+      killSwitch.shutdown()
+      context.stop(self)
+    }
+    case ReplicationActor.StreamStatus => sender() ! StreamStatus(stream.isClosed)
   }
+
+  override def postStop(): Unit = cnxn.asInstanceOf[Connection].close
 }
 
 object ReplicationActor {
-  def props(slotName: String, stream: PGReplicationStream) =
-    Props(new ReplicationActor(slotName, stream))
+  def props(slotName: String, cnxn: PGConnection, stream: PGConnection => PGReplicationStream) =
+    Props(new ReplicationActor(slotName, cnxn, stream))
 
   case object StartProcessing
 
   case object Processing
+
+  case object StreamStatus
+
+  case class StreamStatus(streamIsClosed: Boolean)
+
+  case object StopProcessing
+
 }
 
 class ManagerActor(val replOpts: ReplicationOptions, val supervisorOpt: Option[ActorRef] = None)
-    extends Actor
+  extends Actor
     with LazyLogging
     with ReplicationManager {
 
@@ -84,84 +103,105 @@ class ManagerActor(val replOpts: ReplicationOptions, val supervisorOpt: Option[A
           slot =>
             slot.slotName -> createReplicationActor(
               slot,
-              createReplicationStream(slot.slotName, replOpts.slotOptions)))
+              getConnection,
+              createReplicationStream(slot.slotName, replOpts.slotOptions, statusIntervalMs)))
         .foreach {
           case (_, actorRef) => actorRef ! ReplicationActor.StartProcessing
         }
     }
-
+    case ReplicationActor.StreamStatus(streamIsClosed)
+      if streamIsClosed => {
+      logger.info(s"Stopping actor ${sender().path.name} with closed stream")
+      sender() ! ReplicationActor.StopProcessing
+    }
     case ManagerActor.ReplicationStatus => checkReplicationStatus
     case ManagerActor.TerminateActor(name) => terminateReplicationActor(name)
     case Terminated(actorRef) => {
       supervisorOpt.foreach(ref => ref ! ActorTerminated(actorRef))
-      //drop the replication slot
-      dropReplicationSlot(actorRef.path.name)
-      //remove the catchup record
-      removeCatchupLsn(actorRef.path.name)
+      val (caughtUp, behind) = getReplicationSlotStatusSync(actorRef.path.name)
+        .partition(isCaughtUp)
+
+      caughtUp.foreach(slot => {
+        dropReplicationSlot(slot.slotName)
+        removeCatchupLsn(sender().path.name)
+      })
+
+      behind.foreach(slot => createReplicationActor(ActiveSlot(slot.slotName), getConnection, createReplicationStream(slot.slotName, replOpts.slotOptions, statusIntervalMs)))
     }
   }
 
   def createReplicationActor(slot: ActiveSlot,
-                             replicationStream: PGReplicationStream): ActorRef =
-    context.watch(context.actorOf(ReplicationActor.props(slot.slotName, replicationStream),
-                    slot.slotName))
-
-  def restartActors(slots: Seq[SlotStatus]): Seq[ActorRef] = {
-    slots.map(slot => {
-      logger.info(s"Recreating actor for ${slot.slotName}")
-      terminateReplicationActor(slot.slotName)
-      createReplicationActor(ActiveSlot(slot.slotName), createReplicationStream(slot.slotName, replOpts.slotOptions))
-    })
-  }
+                             cnxn: PGConnection,
+                             replicationStream: PGConnection => PGReplicationStream): ActorRef =
+    context.watch(context.actorOf(ReplicationActor.props(slot.slotName, cnxn, replicationStream),
+      slot.slotName))
 
   def checkReplicationStatus = {
     logger.info("Interrogating slot status")
     //get replication slots
-    val slots = getReplicationSlotStatusSync
-    //get any slots whose actor has died and resume processing
-    restartActors(slots.filterNot(_.isActive))
-    //get any slots that have exceeded the configured threshhold
-    val behind = slots.filter(exceedsThreshold(_, replOpts.replicationThreshold))
+    val (activeSlots, inactiveSlots) = getReplicationSlotStatusSync.partition(_.isActive)
+
+    val (slotsWithNoActor, slotsWithInactiveActors) = inactiveSlots.partition(slot => actorForSlot(slot.slotName).isEmpty)
+
+    //recreate actors for empty slots
+    slotsWithNoActor.map(slot => createReplicationActor(ActiveSlot(slot.slotName, slot.catchupLsn),
+      getConnection,
+      createReplicationStream(slot.slotName, replOpts.slotOptions)
+    ))
+
+    slotsWithInactiveActors.flatMap(slot => actorForSlot(slot.slotName)).map(_ ! StopProcessing)
+
+    //get any slots whose stream has closed and resume processing
+    activeSlots
+      .flatMap(slot => actorForSlot(slot.slotName))
+      .foreach(_ ! StreamStatus)
+
     // slots that have recently fallen behind will not have a catchupLsn assigned
     val (unassigned, assigned) =
-      behind.partition(slot => slot.catchupLsn.isEmpty)
-    unassigned.foreach(slot => {
-      if (slots.length < replOpts.maxSlots) {
-        //create a new replication slot
-        val (catchupSlot, xlog) =
-          createReplicationSlot()
-        //create record for new slot
-        insertCatchupLsn(catchupSlot.slotName)
-        logger.warn(s"Creating catchup slot / actor for ${slot.slotName} at lsn: $xlog")
-        updateCatchupLsn(slot.slotName, Some(xlog))
-        //assign actor to newly created replication slot and start processing
-        createReplicationActor(catchupSlot,
-                               createReplicationStream(
-                                 catchupSlot.slotName,
-                                 replOpts.slotOptions)) ! ReplicationActor.StartProcessing
-      } else {
-        logger.warn(
-          s"Max replication slots have been created but slot ${slot.slotName} has fallen behind.")
-      }
-    })
+      activeSlots.partition(slot => slot.catchupLsn.isEmpty)
+
+    unassigned.filter(exceedsThreshold(_))
+      .foreach(slot => {
+        if (activeSlots.length < replOpts.maxSlots) {
+          //create a new replication slot
+          val (catchupSlot, xlog) = createReplicationSlot()
+          //create record for new slot
+          insertCatchupLsn(catchupSlot.slotName)
+          logger.warn(s"Creating catchup slot / actor for ${slot.slotName} at lsn: $xlog")
+          updateCatchupLsn(slot.slotName, Some(xlog))
+          //assign actor to newly created replication slot and start processing
+          createReplicationActor(catchupSlot,
+            getConnection,
+            createReplicationStream(
+              catchupSlot.slotName,
+              replOpts.slotOptions,
+              statusIntervalMs
+            )) ! ReplicationActor.StartProcessing
+        } else {
+          logger.warn(
+            s"Max replication slots have been created but slot ${slot.slotName} has fallen behind.")
+        }
+      })
     assigned
       .filter(isCaughtUp)
       .foreach(slot => {
-        logger.warn(s"Terminating slot / actor ${slot.slotName}")
         //terminate actor assigned to the slot
         terminateReplicationActor(slot.slotName)
       })
   }
 
-  def exceedsThreshold(slotStatus: SlotStatus, threshold: Long): Boolean =
+  def actorForSlot(slotName: String) = context.child(slotName)
+
+  def exceedsThreshold(slotStatus: SlotStatus, threshold: Long = replOpts.replicationThreshold): Boolean =
     slotStatus.walDist.map(_ > threshold).getOrElse(false)
 
   def isCaughtUp(slotStatus: SlotStatus): Boolean =
-    slotStatus.catchupDist.map(_ <= 0).getOrElse(true)
+    slotStatus.catchupDist.map(_ <= 0).getOrElse(false)
 
   def terminateReplicationActor(slotName: String) =
     context.child(slotName).map(r => {
-     Await.result(r ? PoisonPill, Duration.Inf)
+      logger.warn(s"Terminating actor $slotName")
+      r ! ReplicationActor.StopProcessing
     })
 }
 

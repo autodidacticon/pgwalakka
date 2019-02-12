@@ -48,6 +48,7 @@ object WalAkka
         insertCatchupLsn(activeSlot.slotName)
         getReplicationSlotsSync
       }
+      case e => e
     }
   }
 

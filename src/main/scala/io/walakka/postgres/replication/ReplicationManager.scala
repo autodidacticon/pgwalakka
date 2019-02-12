@@ -47,7 +47,7 @@ trait ReplicationManager extends Db {
 
   val statusIntervalMs: Int
 
-  def generateSlotName(inputName: Option[String] = None): String = inputName.map(_.replaceAll("^\\w", "_")).getOrElse(Random.alphanumeric.take(8).toList.mkString).toLowerCase
+  def generateSlotName(inputName: Option[String] = None): String = "walakka_" + inputName.map(_.replaceAll("^\\w", "_")).getOrElse(Random.alphanumeric.take(4).toList.mkString).toLowerCase
 
   def createReplicationSlot(
       slotName: String = generateSlotName(),
@@ -67,9 +67,9 @@ trait ReplicationManager extends Db {
   def createReplicationStream(
       slotName: String,
       slotOptions: Map[String, String],
-      statusInterval: Int = statusIntervalMs): PGReplicationStream = {
+      statusInterval: Int = statusIntervalMs)(cnxn: PGConnection): PGReplicationStream = {
     //use an anonymous connection instance to pass with the replication stream
-    val builder = getConnection.getReplicationAPI
+    val builder = cnxn.getReplicationAPI
       .replicationStream()
       .logical()
       .withSlotName(slotName)
@@ -119,18 +119,39 @@ trait ReplicationManager extends Db {
   def getReplicationSlotStatusSync: Seq[SlotStatus] =
     runSync(getReplicationSlotStatus)
 
+  def getReplicationSlotStatus(slotName: String): DBIO[Option[SlotStatus]] = {
+    implicit val getSlotStatus = GetResult(
+      r =>
+        SlotStatus(r.nextString(),
+          r.nextBoolean(),
+          r.nextLongOption(),
+          r.nextLongOption(),
+          r.nextStringOption().map(LogSequenceNumber.valueOf)))
+    sql"""select sc.slot_name,
+          coalesce(prs.active, false) as is_active,
+         pg_xlog_location_diff(pg_current_xlog_insert_location(), prs.confirmed_flush_lsn) as wal_dist,
+         pg_xlog_location_diff(sc.catchup_lsn :: pg_lsn, prs.confirmed_flush_lsn) as catchup_dist,
+         sc.catchup_lsn
+         from walakka.slot_catchup sc left join pg_replication_slots prs on prs.slot_name = sc.slot_name
+         where sc.slot_name = $slotName
+      """
+      .as[SlotStatus].headOption
+  }
+
+  def getReplicationSlotStatusSync(slotName: String): Option[SlotStatus] = runSync(getReplicationSlotStatus(slotName))
+
   def removeCatchupLsn(slotName: String): Int =
     runSync(Tables.SlotCatchup.filter(_.slotName === slotName).delete)
 
   def insertCatchupLsn(slotName: String, catchupLsn: Option[LogSequenceNumber] = None) =
     runSync({
       DBIO.seq(
-        SlotCatchup += SlotCatchupRow(Some(slotName),
+        SlotCatchup += SlotCatchupRow(slotName,
           catchupLsn.map(_.asString())))
     })
 
   def updateCatchupLsn(slotName: String, catchupLsn: Option[LogSequenceNumber]) = runSync({
-    SlotCatchup.insertOrUpdate(SlotCatchupRow(Some(slotName), catchupLsn.map(_.asString())))
+    SlotCatchup.insertOrUpdate(SlotCatchupRow(slotName, catchupLsn.map(_.asString())))
   })
 
   def getCurrentXlog: LogSequenceNumber = {

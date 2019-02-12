@@ -7,6 +7,7 @@ import org.postgresql.replication.{LogSequenceNumber, PGReplicationStream}
 import org.scalatest.mockito.MockitoSugar
 import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpecLike}
 import org.mockito.Mockito._
+import org.postgresql.PGConnection
 
 import scala.language.postfixOps
 
@@ -25,11 +26,12 @@ class ReplicationActorSpec(_system: ActorSystem)
 
   "A Replication Actor" should {
     "call getLastFlushedLsn when queried for status" in {
-      val mockStream = mock[PGReplicationStream]
+      val mockStream: PGConnection => PGReplicationStream = _ => mock[PGReplicationStream]
+      val mockCnxn = mock[PGConnection]
       val mockDb = mock[Db]
-      val testActor = system.actorOf(ReplicationActor.props("test", mockStream))
+      val testActor = system.actorOf(ReplicationActor.props("test", mockCnxn, mockStream))
 //      testActor ! StatusQuery
-      when(mockStream.getLastFlushedLSN).thenReturn(LogSequenceNumber.valueOf(1L))
+//      when(mockStream.getLastFlushedLSN).thenReturn(LogSequenceNumber.valueOf(1L))
     }
   }
 }

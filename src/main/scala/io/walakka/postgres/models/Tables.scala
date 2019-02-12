@@ -92,37 +92,25 @@ trait Tables {
     tag => new PgReplicationSlots(tag))
 
   /** Entity class storing rows of table SlotCatchup
-    *  @param slotName Database column slot_name SqlType(text), Default(None)
-    *  @param catchupLsn Database column catchup_lsn SqlType(pg_lsn), Length(2147483647,false), Default(None) */
-  case class SlotCatchupRow(slotName: Option[String] = None,
-                            catchupLsn: Option[String] = None)
-
+    *  @param slotName Database column slot_name SqlType(text), PrimaryKey
+    *  @param catchupLsn Database column catchup_lsn SqlType(text), Default(None) */
+  case class SlotCatchupRow(slotName: String, catchupLsn: Option[String] = None)
   /** GetResult implicit for fetching SlotCatchupRow objects using plain SQL queries */
-  implicit def GetResultSlotCatchupRow(
-      implicit e0: GR[Option[String]]): GR[SlotCatchupRow] = GR { prs =>
-    import prs._
-    SlotCatchupRow.tupled((<<?[String], <<?[String]))
+  implicit def GetResultSlotCatchupRow(implicit e0: GR[String], e1: GR[Option[String]]): GR[SlotCatchupRow] = GR{
+    prs => import prs._
+      SlotCatchupRow.tupled((<<[String], <<?[String]))
   }
-
   /** Table description of table slot_catchup. Objects of this class serve as prototypes for rows in queries. */
-  class SlotCatchup(_tableTag: Tag)
-      extends profile.api.Table[SlotCatchupRow](_tableTag,
-                                                Some("walakka"),
-                                                "slot_catchup") {
-    def * =
-      (slotName, catchupLsn) <> (SlotCatchupRow.tupled, SlotCatchupRow.unapply)
+  class SlotCatchup(_tableTag: Tag) extends profile.api.Table[SlotCatchupRow](_tableTag, Some("walakka"), "slot_catchup") {
+    def * = (slotName, catchupLsn) <> (SlotCatchupRow.tupled, SlotCatchupRow.unapply)
+    /** Maps whole row to an option. Useful for outer joins. */
+    def ? = (Rep.Some(slotName), catchupLsn).shaped.<>({r=>import r._; _1.map(_=> SlotCatchupRow.tupled((_1.get, _2)))}, (_:Any) =>  throw new Exception("Inserting into ? projection not supported."))
 
-    /** Database column slot_name SqlType(text), Default(None) */
-    val slotName: Rep[Option[String]] =
-      column[Option[String]]("slot_name", O.Default(None))
-
-    /** Database column catchup_lsn SqlType(pg_lsn), Length(2147483647,false), Default(None) */
-    val catchupLsn: Rep[Option[String]] = column[Option[String]](
-      "catchup_lsn",
-      O.Length(2147483647, varying = false),
-      O.Default(None))
+    /** Database column slot_name SqlType(text), PrimaryKey */
+    val slotName: Rep[String] = column[String]("slot_name", O.PrimaryKey)
+    /** Database column catchup_lsn SqlType(text), Default(None) */
+    val catchupLsn: Rep[Option[String]] = column[Option[String]]("catchup_lsn", O.Default(None))
   }
-
   /** Collection-like TableQuery object for table SlotCatchup */
   lazy val SlotCatchup = new TableQuery(tag => new SlotCatchup(tag))
 
