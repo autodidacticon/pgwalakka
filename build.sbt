@@ -4,11 +4,13 @@ version := "0.1"
 
 scalaVersion := "2.12.8"
 
-lazy val akkaVersion = "2.5.19"
+lazy val akkaVersion = "2.5.22"
 
 lazy val postgresVersion = "42.2.5"
 
 lazy val slickVersion = "3.2.3"
+
+lazy val kafkaClientVersion = "2.1.1"
 
 libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-actor" % akkaVersion,
@@ -24,11 +26,12 @@ libraryDependencies ++= Seq(
   "org.json4s" %% "json4s-native" % "3.6.3",
   "org.json4s" %% "json4s-jackson" % "3.6.3",
   "org.slf4j" % "slf4j-log4j12" % "1.7.10",
+  "org.apache.kafka" % "kafka-clients" % kafkaClientVersion
 ) ++ testDependencies
 
 lazy val testDependencies = Seq(
-  "org.scalatest" %% "scalatest" % "3.0.5" % "test",
-  "org.mockito" % "mockito-core" % "2.23.4" % "test"
+  "org.scalatest" %% "scalatest" % "3.0.5" % Test,
+  "org.mockito" % "mockito-core" % "2.23.4" % Test
 )
 
 antlr4PackageName in Antlr4 := Some("io.walakka.postgres.replication.logicaldecoding")

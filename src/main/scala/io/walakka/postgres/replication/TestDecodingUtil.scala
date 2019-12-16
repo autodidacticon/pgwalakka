@@ -1,10 +1,17 @@
 package io.walakka.postgres.replication
 
-import io.walakka.postgres.replication.logicaldecoding.{PgLogicalDecodingLexer, PgLogicalDecodingParser}
+import io.walakka.postgres.replication.logicaldecoding.{
+  PgLogicalDecodingLexer,
+  PgLogicalDecodingParser
+}
 import org.antlr.v4.runtime.tree.ParseTreeWalker
 import org.antlr.v4.runtime.{CharStreams, CommonTokenStream}
 
-trait TestDecodingUtil {
+trait AbstractParser[T, R] {
+  def parseMsg(msg: String): Option[R]
+}
+
+trait TestDecodingUtil extends AbstractParser[String, DbMsg] {
 
   def parseMsg(msg: String): Option[DbMsg] = {
     val lexer = new PgLogicalDecodingLexer(CharStreams.fromString(msg))

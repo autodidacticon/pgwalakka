@@ -7,11 +7,12 @@ import com.typesafe.scalalogging.LazyLogging
 import io.walakka.actors.{ReplicationOptions, WalAkkaSystem}
 import io.walakka.actors.ManagerActor.ReplicationStatus
 import io.walakka.postgres.replication.{ActiveSlot, ReplicationManager}
+import io.walakka.producers.DummyProducer
 
 import scala.collection.JavaConverters._
 
 object WalAkka
-    extends App
+  extends App
     with ReplicationManager
     with WalAkkaSystem
     with LazyLogging {
@@ -36,29 +37,34 @@ object WalAkka
     curSlots match {
       case e: Seq[ActiveSlot] if e.isEmpty => {
         logger.info("Creating initial replication slot")
-        val name = "walakka"
+        val name = this.getClass.getName
         createReplicationSlot(name)
         insertCatchupLsn(name)
         getReplicationSlotsSync
       }
-        //if all slots are catchup slots, then create a new 'leader' slot
+      //if all slots are catchup slots, then create a new 'leader' slot
       case e if e.filter(_.catchupLsn.isEmpty).isEmpty => {
         logger.info("Creating leader replication slot")
-        val (activeSlot, _) = createReplicationSlot()
-        insertCatchupLsn(activeSlot.slotName)
-        getReplicationSlotsSync
+        createReplicationSlot()
+          .map(activeSlot => {
+            insertCatchupLsn(activeSlot.slotName)
+            getReplicationSlotsSync
+          })
+          .getOrElse(Seq.empty)
       }
       case e => e
     }
   }
 
-  val mgr = createManagerActor(new ReplicationOptions(replicationThreshold,
-                               slotOptions,
-                               statusIntervalMs,
-                               maxSlots))
+  val replicationOptions = new ReplicationOptions(replicationThreshold,
+    slotOptions,
+    statusIntervalMs,
+    maxSlots)
+
+  val mgr = createManagerActor(replicationOptions, actorSystemName, getConnection, new DummyProducer {})
 
   //create replication actors
-  mgr ! activeSlots
+  activeSlots.foreach(mgr ! _)
 
   run
 

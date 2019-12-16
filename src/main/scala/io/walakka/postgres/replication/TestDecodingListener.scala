@@ -1,6 +1,9 @@
 package io.walakka.postgres.replication
 
-import io.walakka.postgres.replication.logicaldecoding.{PgLogicalDecodingListener, PgLogicalDecodingParser}
+import io.walakka.postgres.replication.logicaldecoding.{
+  PgLogicalDecodingListener,
+  PgLogicalDecodingParser
+}
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.tree.{ErrorNode, TerminalNode}
 

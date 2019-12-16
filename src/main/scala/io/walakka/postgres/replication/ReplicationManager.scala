@@ -5,6 +5,7 @@ import java.util.Properties
 import java.util.concurrent.TimeUnit
 
 import com.typesafe.config.ConfigFactory
+import io.walakka.actors.ReplicationOptions
 import io.walakka.postgres.models.Tables
 import io.walakka.postgres.models.Tables.{SlotCatchup, SlotCatchupRow}
 import org.postgresql.replication.{LogSequenceNumber, PGReplicationStream}
@@ -14,24 +15,10 @@ import slick.jdbc.PostgresProfile.api._
 
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
-import scala.util.Random
+import scala.util.{Random, Try}
 
 trait Db {
   lazy val db = Database.forConfig("db")
-  lazy val config = ConfigFactory.load()
-
-  protected def getConnection = {
-
-    val url = config.getString("db.jdbcUrl")
-    val props = new Properties()
-    PGProperty.USER.set(props, "postgres")
-    PGProperty.PASSWORD.set(props, "postgres")
-    PGProperty.ASSUME_MIN_SERVER_VERSION.set(props, "9.4")
-    PGProperty.REPLICATION.set(props, "database")
-    PGProperty.PREFER_QUERY_MODE.set(props, "simple")
-
-    DriverManager.getConnection(url, props).unwrap(classOf[PGConnection])
-  }
 
   def getTxTsFromTxId(txId: String): Timestamp = {
     Await.result(
@@ -44,43 +31,48 @@ trait Db {
 }
 
 trait ReplicationManager extends Db {
+  
+  val replicationOptions: ReplicationOptions
+  
+  val getConnection: () => PGConnection
 
-  val statusIntervalMs: Int
-
-  def generateSlotName(inputName: Option[String] = None): String = "walakka_" + inputName.map(_.replaceAll("^\\w", "_")).getOrElse(Random.alphanumeric.take(4).toList.mkString).toLowerCase
-
-  def createReplicationSlot(
-      slotName: String = generateSlotName(),
-      outputPlugin: String = "test_decoding"): (ActiveSlot, LogSequenceNumber) = {
-    val (_, lsn) = runSync(sql"select * from pg_create_logical_replication_slot($slotName, $outputPlugin)"
-        .as[(String, String)]
-        .head)
-
-    ActiveSlot(slotName) -> LogSequenceNumber.valueOf(lsn)
-  }
-
-  def dropReplicationSlot(slotName: String): Int =
-    runSync(
-      sql"select 1 from pg_drop_replication_slot($slotName)".as[Int].head)
-
-
-  def createReplicationStream(
-      slotName: String,
-      slotOptions: Map[String, String],
-      statusInterval: Int = statusIntervalMs)(cnxn: PGConnection): PGReplicationStream = {
+  def createReplicationStream(slotName: String, connection: PGConnection = getConnection(), slotOptions: ReplicationOptions = replicationOptions): PGReplicationStream = {
     //use an anonymous connection instance to pass with the replication stream
-    val builder = cnxn.getReplicationAPI
+    val builder = connection.getReplicationAPI
       .replicationStream()
       .logical()
       .withSlotName(slotName)
-      .withStatusInterval(statusInterval, TimeUnit.MILLISECONDS)
-    //TODO: casting all options to strings, need to test
-    slotOptions
+      .withStatusInterval(replicationOptions.statusIntervalMs, TimeUnit.MILLISECONDS)
+    replicationOptions.slotOptions
       .foldLeft(builder) {
         case (builder, t) => builder.withSlotOption(t._1, t._2)
       }
       .start()
   }
+
+  def getConnectionAndStream(slotName: String, connection: PGConnection = getConnection()): (PGConnection, PGReplicationStream) = {
+    connection -> createReplicationStream(slotName, connection)
+  }
+
+  def generateSlotName(inputName: Option[String] = None): String =
+    "walakka_" + inputName
+      .map(_.replaceAll("^\\w", "_"))
+      .getOrElse(Random.alphanumeric.take(4).toList.mkString)
+      .toLowerCase
+
+  def createReplicationSlot(slotName: String = generateSlotName(),
+                            outputPlugin: String = "test_decoding")
+  : Try[ActiveSlot] = Try {
+    val (_, lsn) = runSync(
+      sql"select * from pg_create_logical_replication_slot($slotName, $outputPlugin)"
+        .as[(String, String)]
+        .head)
+
+    ActiveSlot(slotName, Some(LogSequenceNumber.valueOf(lsn)))
+  }
+
+  def dropReplicationSlot(slotName: String): Int =
+    runSync(sql"select 1 from pg_drop_replication_slot($slotName)".as[Int].head)
 
   def getReplicationSlotDist(slotName: String): DBIO[Int] = {
     sql"select pg_xlog_location_diff(pg_current_xlog_insert_location(), restart_lsn) from pg_replication_slots where slot_name = $slotName"
@@ -92,7 +84,7 @@ trait ReplicationManager extends Db {
     implicit val getActiveSlot = GetResult(
       r =>
         ActiveSlot(r.nextString(),
-                   r.nextStringOption().map(LogSequenceNumber.valueOf)))
+          r.nextStringOption().map(LogSequenceNumber.valueOf)))
     sql"select prs.slot_name, sc.catchup_lsn from walakka.slot_catchup sc left join pg_replication_slots prs on prs.slot_name = sc.slot_name where prs.slot_name like 'walakka%'"
       .as[ActiveSlot]
   }
@@ -103,10 +95,10 @@ trait ReplicationManager extends Db {
     implicit val getSlotStatus = GetResult(
       r =>
         SlotStatus(r.nextString(),
-                   r.nextBoolean(),
-                   r.nextLongOption(),
-                   r.nextLongOption(),
-                   r.nextStringOption().map(LogSequenceNumber.valueOf)))
+          r.nextBoolean(),
+          r.nextLongOption(),
+          r.nextLongOption(),
+          r.nextStringOption().map(LogSequenceNumber.valueOf)))
     sql"""select sc.slot_name,
           coalesce(prs.active, false) as is_active,
          pg_xlog_location_diff(pg_current_xlog_insert_location(), prs.confirmed_flush_lsn) as wal_dist,
@@ -135,28 +127,35 @@ trait ReplicationManager extends Db {
          from walakka.slot_catchup sc left join pg_replication_slots prs on prs.slot_name = sc.slot_name
          where sc.slot_name = $slotName
       """
-      .as[SlotStatus].headOption
+      .as[SlotStatus]
+      .headOption
   }
 
-  def getReplicationSlotStatusSync(slotName: String): Option[SlotStatus] = runSync(getReplicationSlotStatus(slotName))
+  def getReplicationSlotStatusSync(slotName: String): Option[SlotStatus] =
+    runSync(getReplicationSlotStatus(slotName))
 
   def removeCatchupLsn(slotName: String): Int =
     runSync(Tables.SlotCatchup.filter(_.slotName === slotName).delete)
 
-  def insertCatchupLsn(slotName: String, catchupLsn: Option[LogSequenceNumber] = None) =
+  def insertCatchupLsn(slotName: String,
+                       catchupLsn: Option[LogSequenceNumber] = None) =
     runSync({
       DBIO.seq(
-        SlotCatchup += SlotCatchupRow(slotName,
-          catchupLsn.map(_.asString())))
+        SlotCatchup += SlotCatchupRow(slotName, catchupLsn.map(_.asString())))
     })
 
-  def updateCatchupLsn(slotName: String, catchupLsn: Option[LogSequenceNumber]) = runSync({
-    SlotCatchup.insertOrUpdate(SlotCatchupRow(slotName, catchupLsn.map(_.asString())))
-  })
+  def updateCatchupLsn(slotName: String,
+                       catchupLsn: Option[LogSequenceNumber]) =
+    runSync({
+      SlotCatchup.insertOrUpdate(
+        SlotCatchupRow(slotName, catchupLsn.map(_.asString())))
+    })
 
   def getCurrentXlog: LogSequenceNumber = {
     implicit val rconv = GetResult(r => LogSequenceNumber.valueOf(r.nextString))
-    runSync(sql"select pg_current_xlog_insert_location() as wal_current".as[LogSequenceNumber]).head
+    runSync(
+      sql"select pg_current_xlog_insert_location() as wal_current"
+        .as[LogSequenceNumber]).head
   }
 }
 
